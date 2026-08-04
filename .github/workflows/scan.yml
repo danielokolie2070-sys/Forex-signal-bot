@@ -1,0 +1,36 @@
+name: Forex Signal Bot Scan
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run signal scan
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: node bot.js
+
+      - name: Save state
+        if: always()
+        run: |
+          git config --global user.name "Signal Bot"
+          git config --global user.email "bot@signal.local"
+          if [ -f state.json ]; then
+            git add state.json
+            git commit -m "Update bot state [skip ci]" || echo "No changes"
+            git push || echo "Push failed"
+          fi
+          
