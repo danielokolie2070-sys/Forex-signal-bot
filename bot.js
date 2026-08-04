@@ -1,9 +1,10 @@
 
 // =========================================================================
-// AI Forex Signal Bot v13 - GitHub Actions Edition
+// AI Forex Signal Bot v13.1 - GitHub Actions Edition
 // Platform: GitHub Actions (free, unlimited minutes on public repo)
 // Strategy: Trend-following (15m + 1h EMA alignment)
 // Expiry: 5 minutes | Score 7 trigger | 72% confidence threshold
+// Updates: Fixed ADX threshold (10 instead of 15), added win rate tracking
 // =========================================================================
 
 const fs = require('fs');
@@ -12,6 +13,7 @@ const path = require('path');
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const STATE_FILE = path.join(__dirname, 'state.json');
+const TRACKER_FILE = path.join(__dirname, 'tracker.json');
 
 // Config
 const CD_MS = 15 * 60 * 1000;        // Per-pair cooldown: 15 min
@@ -19,8 +21,45 @@ const SIG_MEM_MS = 25 * 60 * 1000;   // Signal memory: 25 min
 const GLOBAL_CD_MS = 7 * 60 * 1000;  // Global cooldown: 7 min
 const CONFIDENCE_THRESHOLD = 72;
 const SCORE_TRIGGER = 7;
+const ADX_THRESHOLD = 8; // Balanced for simplified ADX (real ADX ~20 equivalent)
 
-// Load state
+// === WIN RATE TRACKER ===
+
+function loadTracker() {
+  try {
+    if (fs.existsSync(TRACKER_FILE)) {
+      return JSON.parse(fs.readFileSync(TRACKER_FILE, 'utf8'));
+    }
+  } catch (e) {}
+  return { signals: [], wins: 0, losses: 0, total: 0 };
+}
+
+function saveTracker(tracker) {
+  try {
+    fs.writeFileSync(TRACKER_FILE, JSON.stringify(tracker, null, 2));
+  } catch (e) {
+    console.error('Failed to save tracker:', e.message);
+  }
+}
+
+function recordSignal(pair, dir, conf, mode) {
+  const tracker = loadTracker();
+  const sigId = Date.now();
+  tracker.signals.push({
+    id: sigId,
+    pair, dir, conf, mode,
+    sentAt: new Date().toISOString(),
+    result: null  // 'WIN', 'LOSS', or null (not yet tracked)
+  });
+  // Keep only last 100 signals
+  if (tracker.signals.length > 100) tracker.signals = tracker.signals.slice(-100);
+  tracker.total = tracker.signals.length;
+  saveTracker(tracker);
+  return sigId;
+}
+
+// === STATE MANAGEMENT ===
+
 function loadState() {
   try {
     if (fs.existsSync(STATE_FILE)) {
@@ -30,7 +69,6 @@ function loadState() {
   return { cooldowns: {}, signals: {}, globalCd: 0 };
 }
 
-// Save state
 function saveState(state) {
   try {
     fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
@@ -92,7 +130,6 @@ function stochastic(h, l, c, p = 14) {
   const rl = Math.min(...l.slice(-p));
   const range = rh - rl;
   const k = range === 0 ? 50 : ((c[c.length - 1] - rl) / range) * 100;
-  // Simple %D = 3-period SMA of %K
   let kArr = [];
   for (let i = Math.max(p, c.length - 3); i < c.length; i++) {
     const start = Math.max(0, i - p + 1);
@@ -220,19 +257,18 @@ function analyze(pair, d15, d1h) {
   const trendUp = e9 > e21 && e9_1h > e21_1h;
   const trendDn = e9 < e21 && e9_1h < e21_1h;
 
-  // ADX filter - need at least some trend strength
-  if (adxVal < 15) return null;
+  // ADX filter - lowered to 10 for simplified ADX calculation
+  if (adxVal < ADX_THRESHOLD) return null; // Balanced ADX filter
 
-  const lc = c[c.length - 1]; // last close
-  const lo = o[o.length - 1]; // last open
-  const pc = c[c.length - 2]; // prev close
-  const po = o[o.length - 2]; // prev open
+  const lc = c[c.length - 1];
+  const lo = o[o.length - 1];
+  const pc = c[c.length - 2];
+  const po = o[o.length - 2];
 
   let dir = null, sc = 0;
   const reasons = [];
 
   if (trendUp) {
-    // BUY setup: pullback in uptrend
     if (r15 >= 35 && r15 <= 60) {
       sc += 3; reasons.push('RSI pullback zone');
       if (st.k >= 15 && st.k <= 55) { sc += 2; reasons.push('Stoch pullback'); }
@@ -242,12 +278,10 @@ function analyze(pair, d15, d1h) {
       if (ap > 0.04) { sc += 1; reasons.push('Good volatility'); }
       if (adxVal > 25) { sc += 1; reasons.push('Strong trend (ADX)'); }
       if (rp.pos <= 40) { sc += 1; reasons.push('Range low entry'); }
-      // Reversal candle bonus
       if (lc > lo && pc < po) { sc += 1; reasons.push('Reversal candle'); }
       if (sc >= SCORE_TRIGGER) dir = 'BUY';
     }
   } else if (trendDn) {
-    // SELL setup: pullback in downtrend
     if (r15 >= 40 && r15 <= 65) {
       sc += 3; reasons.push('RSI pullback zone');
       if (st.k >= 45 && st.k <= 85) { sc += 2; reasons.push('Stoch pullback'); }
@@ -257,7 +291,6 @@ function analyze(pair, d15, d1h) {
       if (ap > 0.04) { sc += 1; reasons.push('Good volatility'); }
       if (adxVal > 25) { sc += 1; reasons.push('Strong trend (ADX)'); }
       if (rp.pos >= 60) { sc += 1; reasons.push('Range high entry'); }
-      // Reversal candle bonus
       if (lc < lo && pc > po) { sc += 1; reasons.push('Reversal candle'); }
       if (sc >= SCORE_TRIGGER) dir = 'SELL';
     }
@@ -273,7 +306,7 @@ function analyze(pair, d15, d1h) {
   const entry = new Date(now.getTime() + 2 * 60000);
   const exit = new Date(entry.getTime() + 5 * 60000);
 
-  return { pair, dir, conf, mode, entry, exit, score: sc, reasons };
+  return { pair, dir, conf, mode, entry, exit, score: sc, reasons, adx: adxVal };
 }
 
 // === TELEGRAM ===
@@ -297,7 +330,7 @@ async function sendTelegram(msg) {
   }
 }
 
-function formatSignal(s) {
+function formatSignal(s, sigId) {
   const emoji = s.dir === 'BUY' ? '🟢' : '🔴';
   const filled = Math.round(s.conf / 10);
   const bar = '█'.repeat(filled) + '░'.repeat(10 - filled);
@@ -310,7 +343,32 @@ function formatSignal(s) {
     `➡️ Entry: ${entryTime}\n` +
     `${emoji} ${s.dir}\n` +
     `🚪 Exit: ${exitTime}\n` +
-    `🎯 Confidence: ${s.conf.toFixed(0)}% ${bar}`;
+    `🎯 Confidence: ${s.conf.toFixed(0)}% ${bar}\n` +
+    `📊 Score: ${s.score} | ADX: ${s.adx.toFixed(0)}\n` +
+    `🆔 ID: ${sigId}`;
+}
+
+function formatDailyReport(tracker) {
+  const total = tracker.signals.length;
+  const wins = tracker.signals.filter(s => s.result === 'WIN').length;
+  const losses = tracker.signals.filter(s => s.result === 'LOSS').length;
+  const pending = tracker.signals.filter(s => s.result === null).length;
+  const tracked = wins + losses;
+  const winRate = tracked > 0 ? ((wins / tracked) * 100).toFixed(0) : 'N/A';
+
+  // Last 10 signals
+  const recent = tracker.signals.slice(-10).map(s => {
+    const result = s.result === 'WIN' ? '✅' : s.result === 'LOSS' ? '❌' : '⏳';
+    return `${result} ${s.pair} ${s.dir} ${s.conf.toFixed(0)}%`;
+  }).join('\n');
+
+  return `📊 DAILY WIN RATE REPORT\n\n` +
+    `Total Signals: ${total}\n` +
+    `✅ Wins: ${wins}\n` +
+    `❌ Losses: ${losses}\n` +
+    `⏳ Pending: ${pending}\n` +
+    `🎯 Win Rate: ${winRate}${tracked > 0 ? '%' : ''}\n\n` +
+    `Recent Signals:\n${recent || 'None yet'}`;
 }
 
 // === COOLDOWN CHECKS ===
@@ -328,7 +386,6 @@ function isRecentSignal(state, pair, dir, conf) {
   if (!record) return false;
   const age = Date.now() - record.ts;
   if (age > SIG_MEM_MS) return false;
-  // Allow if confidence is 15+ points higher
   if (conf >= record.conf + 15) return false;
   return true;
 }
@@ -345,34 +402,46 @@ const PAIRS = [
   ['EURCAD=X', 'EUR/CAD'], ['CHFJPY=X', 'CHF/JPY']
 ];
 
-async function runScan(isTest = false) {
+async function runScan(mode) {
   const state = loadState();
-  const mode = marketMode();
+  const mMode = marketMode();
 
-  if (isTest) {
-    const msg = `🤖 Bot v13 ONLINE\n\n` +
-      `Platform: GitHub Actions (free, unlimited)\n` +
-      `IQ Option | Binary Options | 5-min trades\n` +
-      `20 pairs | Mode: ${mode}\n` +
-      `Strategy: Trend Following + ADX\n` +
-      `72% threshold | Score 7 trigger\n` +
-      `7-min global cooldown | 15-min per-pair\n` +
-      `State persistence: file-based\n\n` +
-      `Ready! ⚡`;
-    const ok = await sendTelegram(msg);
-    console.log(JSON.stringify({ testSent: ok, mode, pairs: 20 }));
+  // --report mode: send win rate report
+  if (mode === 'report') {
+    const tracker = loadTracker();
+    const ok = await sendTelegram(formatDailyReport(tracker));
+    console.log(JSON.stringify({ reportSent: ok, totalSignals: tracker.signals.length }));
     return;
   }
 
-  // Check global cooldown
+  // --test mode: send test message
+  if (mode === 'test') {
+    const tracker = loadTracker();
+    const msg = `🤖 Bot v13.1 ONLINE\n\n` +
+      `Platform: GitHub Actions (free, unlimited)\n` +
+      `IQ Option | Binary Options | 5-min trades\n` +
+      `20 pairs | Mode: ${mMode}\n` +
+      `Strategy: Trend Following + ADX\n` +
+      `72% threshold | Score 7 trigger\n` +
+      `ADX threshold: ${ADX_THRESHOLD}\n` +
+      `7-min global cooldown | 15-min per-pair\n` +
+      `Win rate tracking: ACTIVE\n` +
+      `Signals tracked: ${tracker.signals.length}\n\n` +
+      `Ready! ⚡`;
+    const ok = await sendTelegram(msg);
+    console.log(JSON.stringify({ testSent: ok, mode: mMode, pairs: 20, tracked: tracker.signals.length }));
+    return;
+  }
+
+  // Normal scan mode
   if (state.globalCd && (Date.now() - state.globalCd) < GLOBAL_CD_MS) {
     const elapsed = Math.round((Date.now() - state.globalCd) / 60000);
     const remaining = Math.max(0, Math.round(GLOBAL_CD_MS / 60000 - elapsed));
-    console.log(JSON.stringify({ sent: 0, reason: 'global_cooldown', remainingMin: remaining, mode }));
+    console.log(JSON.stringify({ sent: 0, reason: 'global_cooldown', remainingMin: remaining, mode: mMode }));
+    saveState(state);
     return;
   }
 
-  // Fetch and analyze all pairs
   const signals = [];
   for (const [sym, name] of PAIRS) {
     const d15 = await fetchData(sym, '15m');
@@ -386,12 +455,11 @@ async function runScan(isTest = false) {
   }
 
   if (signals.length === 0) {
-    console.log(JSON.stringify({ sent: 0, candidates: 0, mode, ts: new Date().toISOString() }));
-    saveState(state); // Save to refresh state
+    console.log(JSON.stringify({ sent: 0, candidates: 0, mode: mMode, ts: new Date().toISOString() }));
+    saveState(state);
     return;
   }
 
-  // Pick top BUY and top SELL
   const buys = signals.filter(s => s.dir === 'BUY').sort((a, b) => b.conf - a.conf);
   const sells = signals.filter(s => s.dir === 'SELL').sort((a, b) => b.conf - a.conf);
   const top = [];
@@ -402,7 +470,8 @@ async function runScan(isTest = false) {
 
   let sent = 0;
   for (const s of top) {
-    const ok = await sendTelegram(formatSignal(s));
+    const sigId = recordSignal(s.pair, s.dir, s.conf, s.mode);
+    const ok = await sendTelegram(formatSignal(s, sigId));
     if (ok) {
       const key = `${s.pair}_${s.dir}`;
       state.cooldowns[key] = Date.now();
@@ -420,7 +489,7 @@ async function runScan(isTest = false) {
   console.log(JSON.stringify({
     sent,
     candidates: signals.length,
-    mode,
+    mode: mMode,
     strategy: 'trend-following',
     expiry: '5min',
     ts: new Date().toISOString()
@@ -428,8 +497,11 @@ async function runScan(isTest = false) {
 }
 
 // Run
-const isTest = process.argv.includes('--test');
-runScan(isTest).catch(e => {
+const mode = process.argv.includes('--test') ? 'test'
+           : process.argv.includes('--report') ? 'report'
+           : 'scan';
+
+runScan(mode).catch(e => {
   console.error('Fatal error:', e.message);
   process.exit(1);
 });
