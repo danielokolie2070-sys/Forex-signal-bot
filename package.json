@@ -1,0 +1,11 @@
+{
+  "name": "forex-signal-bot",
+  "version": "13.0.0",
+  "description": "AI Forex Signal Bot - GitHub Actions edition",
+  "main": "bot.js",
+  "scripts": {
+    "scan": "node bot.js",
+    "test": "node bot.js --test"
+  },
+  "dependencies": {}
+}
