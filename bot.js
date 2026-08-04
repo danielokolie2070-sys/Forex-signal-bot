@@ -1,10 +1,14 @@
 
+c7c33330a_bot.js
+
+c7c33330a_bot.js
+Download
 // =========================================================================
-// AI Forex Signal Bot v13.1 - GitHub Actions Edition
+// AI Forex Signal Bot v13.2 - GitHub Actions Edition
 // Platform: GitHub Actions (free, unlimited minutes on public repo)
 // Strategy: Trend-following (15m + 1h EMA alignment)
 // Expiry: 5 minutes | Score 7 trigger | 72% confidence threshold
-// Updates: Fixed ADX threshold (10 instead of 15), added win rate tracking
+// Updates: ADX threshold 8, win rate tracking with Telegram W/L replies
 // =========================================================================
 
 const fs = require('fs');
@@ -14,14 +18,15 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const STATE_FILE = path.join(__dirname, 'state.json');
 const TRACKER_FILE = path.join(__dirname, 'tracker.json');
+const UPDATE_FILE = path.join(__dirname, 'last_update.json');
 
 // Config
-const CD_MS = 15 * 60 * 1000;        // Per-pair cooldown: 15 min
-const SIG_MEM_MS = 25 * 60 * 1000;   // Signal memory: 25 min
-const GLOBAL_CD_MS = 7 * 60 * 1000;  // Global cooldown: 7 min
-const CONFIDENCE_THRESHOLD = 72;
+const CD_MS = 15 * 60 * 1000;
+const SIG_MEM_MS = 25 * 60 * 1000;
+const GLOBAL_CD_MS = 7 * 60 * 1000;
+const CONFIDENCE_THRESHOLD = 80; // High-conviction signals only
 const SCORE_TRIGGER = 7;
-const ADX_THRESHOLD = 8; // Balanced for simplified ADX (real ADX ~20 equivalent)
+const ADX_THRESHOLD = 8;
 
 // === WIN RATE TRACKER ===
 
@@ -35,27 +40,102 @@ function loadTracker() {
 }
 
 function saveTracker(tracker) {
-  try {
-    fs.writeFileSync(TRACKER_FILE, JSON.stringify(tracker, null, 2));
-  } catch (e) {
-    console.error('Failed to save tracker:', e.message);
-  }
+  try { fs.writeFileSync(TRACKER_FILE, JSON.stringify(tracker, null, 2)); }
+  catch (e) { console.error('Failed to save tracker:', e.message); }
 }
 
 function recordSignal(pair, dir, conf, mode) {
   const tracker = loadTracker();
   const sigId = Date.now();
   tracker.signals.push({
-    id: sigId,
-    pair, dir, conf, mode,
+    id: sigId, pair, dir, conf, mode,
     sentAt: new Date().toISOString(),
-    result: null  // 'WIN', 'LOSS', or null (not yet tracked)
+    result: null
   });
-  // Keep only last 100 signals
   if (tracker.signals.length > 100) tracker.signals = tracker.signals.slice(-100);
   tracker.total = tracker.signals.length;
   saveTracker(tracker);
   return sigId;
+}
+
+function updateSignalResult(sigId, result) {
+  const tracker = loadTracker();
+  const sig = tracker.signals.find(s => s.id === sigId);
+  if (!sig) return false;
+  if (sig.result !== null) return false; // Already tracked
+  sig.result = result;
+  sig.trackedAt = new Date().toISOString();
+  tracker.wins = tracker.signals.filter(s => s.result === 'WIN').length;
+  tracker.losses = tracker.signals.filter(s => s.result === 'LOSS').length;
+  saveTracker(tracker);
+  return true;
+}
+
+// === TELEGRAM REPLY CHECKER ===
+
+function loadLastUpdate() {
+  try {
+    if (fs.existsSync(UPDATE_FILE)) {
+      return JSON.parse(fs.readFileSync(UPDATE_FILE, 'utf8'));
+    }
+  } catch (e) {}
+  return { offset: 0 };
+}
+
+function saveLastUpdate(data) {
+  try { fs.writeFileSync(UPDATE_FILE, JSON.stringify(data, null, 2)); }
+  catch (e) { console.error('Failed to save update offset:', e.message); }
+}
+
+async function checkReplies() {
+  if (!TELEGRAM_BOT_TOKEN) return { checked: false };
+  const update = loadLastUpdate();
+  try {
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=${update.offset}&timeout=0`;
+    const res = await fetch(url);
+    const data = await res.json();
+    if (!data.ok || !data.result || data.result.length === 0) {
+      return { checked: true, replies: 0 };
+    }
+
+    let processed = 0;
+    let newOffset = update.offset;
+
+    for (const msg of data.result) {
+      newOffset = msg.update_id + 1;
+      const text = msg.message?.text?.trim().toUpperCase();
+      const fromId = String(msg.message?.chat?.id);
+      if (!text || fromId !== TELEGRAM_CHAT_ID) continue;
+
+      // Parse: "W 1691234567" or "L 1691234567" or "W1691234567"
+      const match = text.match(/^([WL])\s*(\d+)/);
+      if (!match) continue;
+
+      const result = match[1] === 'W' ? 'WIN' : 'LOSS';
+      const sigId = parseInt(match[2]);
+
+      const updated = updateSignalResult(sigId, result);
+      if (updated) {
+        processed++;
+        const tracker = loadTracker();
+        const wr = tracker.wins + tracker.losses > 0
+          ? ((tracker.wins / (tracker.wins + tracker.losses)) * 100).toFixed(0)
+          : 'N/A';
+        const emoji = result === 'WIN' ? '✅' : '❌';
+        await sendTelegram(
+          `${emoji} Result logged: ${result}\n\n` +
+          `📊 Win Rate: ${wr}% (${tracker.wins}W / ${tracker.losses}L)\n` +
+          `Pending: ${tracker.signals.filter(s => s.result === null).length}`
+        );
+      }
+    }
+
+    saveLastUpdate({ offset: newOffset });
+    return { checked: true, replies: processed };
+  } catch (e) {
+    console.error('Reply check error:', e.message);
+    return { checked: false, error: e.message };
+  }
 }
 
 // === STATE MANAGEMENT ===
@@ -70,11 +150,8 @@ function loadState() {
 }
 
 function saveState(state) {
-  try {
-    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
-  } catch (e) {
-    console.error('Failed to save state:', e.message);
-  }
+  try { fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2)); }
+  catch (e) { console.error('Failed to save state:', e.message); }
 }
 
 // === INDICATORS ===
@@ -234,7 +311,6 @@ function analyze(pair, d15, d1h) {
   const c1h = d1h.c;
   const price = c[c.length - 1];
 
-  // Indicators
   const r15 = rsi(c, 14);
   const st = stochastic(h, l, c, 14);
   const bands = bollinger(c, 20, 2);
@@ -244,54 +320,45 @@ function analyze(pair, d15, d1h) {
   const adxVal = adx(h, l, c, 14);
   const rp = rangePos(c, 20);
 
-  // EMAs
-  const e9 = ema(c, 9);
-  const e21 = ema(c, 21);
-  const e9_1h = ema(c1h, 9);
-  const e21_1h = ema(c1h, 21);
+  const e9 = ema(c, 9), e21 = ema(c, 21);
+  const e9_1h = ema(c1h, 9), e21_1h = ema(c1h, 21);
 
-  // Volatility filter
   if (ap < 0.02) return null;
 
-  // Trend detection
   const trendUp = e9 > e21 && e9_1h > e21_1h;
   const trendDn = e9 < e21 && e9_1h < e21_1h;
 
-  // ADX filter - lowered to 10 for simplified ADX calculation
-  if (adxVal < ADX_THRESHOLD) return null; // Balanced ADX filter
+  if (adxVal < ADX_THRESHOLD) return null;
 
-  const lc = c[c.length - 1];
-  const lo = o[o.length - 1];
-  const pc = c[c.length - 2];
-  const po = o[o.length - 2];
+  const lc = c[c.length - 1], lo = o[o.length - 1];
+  const pc = c[c.length - 2], po = o[o.length - 2];
 
   let dir = null, sc = 0;
-  const reasons = [];
 
   if (trendUp) {
     if (r15 >= 35 && r15 <= 60) {
-      sc += 3; reasons.push('RSI pullback zone');
-      if (st.k >= 15 && st.k <= 55) { sc += 2; reasons.push('Stoch pullback'); }
-      if (mc.h > 0) { sc += 2; reasons.push('MACD bullish'); }
-      if (lc > lo) { sc += 2; reasons.push('Bullish candle'); }
-      if (price <= bands.m * 1.005) { sc += 1; reasons.push('Near BB mid'); }
-      if (ap > 0.04) { sc += 1; reasons.push('Good volatility'); }
-      if (adxVal > 25) { sc += 1; reasons.push('Strong trend (ADX)'); }
-      if (rp.pos <= 40) { sc += 1; reasons.push('Range low entry'); }
-      if (lc > lo && pc < po) { sc += 1; reasons.push('Reversal candle'); }
+      sc += 3;
+      if (st.k >= 15 && st.k <= 55) sc += 2;
+      if (mc.h > 0) sc += 2;
+      if (lc > lo) sc += 2;
+      if (price <= bands.m * 1.005) sc += 1;
+      if (ap > 0.04) sc += 1;
+      if (adxVal > 25) sc += 1;
+      if (rp.pos <= 40) sc += 1;
+      if (lc > lo && pc < po) sc += 1;
       if (sc >= SCORE_TRIGGER) dir = 'BUY';
     }
   } else if (trendDn) {
     if (r15 >= 40 && r15 <= 65) {
-      sc += 3; reasons.push('RSI pullback zone');
-      if (st.k >= 45 && st.k <= 85) { sc += 2; reasons.push('Stoch pullback'); }
-      if (mc.h < 0) { sc += 2; reasons.push('MACD bearish'); }
-      if (lc < lo) { sc += 2; reasons.push('Bearish candle'); }
-      if (price >= bands.m * 0.995) { sc += 1; reasons.push('Near BB mid'); }
-      if (ap > 0.04) { sc += 1; reasons.push('Good volatility'); }
-      if (adxVal > 25) { sc += 1; reasons.push('Strong trend (ADX)'); }
-      if (rp.pos >= 60) { sc += 1; reasons.push('Range high entry'); }
-      if (lc < lo && pc > po) { sc += 1; reasons.push('Reversal candle'); }
+      sc += 3;
+      if (st.k >= 45 && st.k <= 85) sc += 2;
+      if (mc.h < 0) sc += 2;
+      if (lc < lo) sc += 2;
+      if (price >= bands.m * 0.995) sc += 1;
+      if (ap > 0.04) sc += 1;
+      if (adxVal > 25) sc += 1;
+      if (rp.pos >= 60) sc += 1;
+      if (lc < lo && pc > po) sc += 1;
       if (sc >= SCORE_TRIGGER) dir = 'SELL';
     }
   }
@@ -306,7 +373,7 @@ function analyze(pair, d15, d1h) {
   const entry = new Date(now.getTime() + 2 * 60000);
   const exit = new Date(entry.getTime() + 5 * 60000);
 
-  return { pair, dir, conf, mode, entry, exit, score: sc, reasons, adx: adxVal };
+  return { pair, dir, conf, mode, entry, exit, score: sc, adx: adxVal };
 }
 
 // === TELEGRAM ===
@@ -345,7 +412,8 @@ function formatSignal(s, sigId) {
     `🚪 Exit: ${exitTime}\n` +
     `🎯 Confidence: ${s.conf.toFixed(0)}% ${bar}\n` +
     `📊 Score: ${s.score} | ADX: ${s.adx.toFixed(0)}\n` +
-    `🆔 ID: ${sigId}`;
+    `🆔 ID: ${sigId}\n\n` +
+    `📝 Reply "W ${sigId}" if win, "L ${sigId}" if loss`;
 }
 
 function formatDailyReport(tracker) {
@@ -356,7 +424,6 @@ function formatDailyReport(tracker) {
   const tracked = wins + losses;
   const winRate = tracked > 0 ? ((wins / tracked) * 100).toFixed(0) : 'N/A';
 
-  // Last 10 signals
   const recent = tracker.signals.slice(-10).map(s => {
     const result = s.result === 'WIN' ? '✅' : s.result === 'LOSS' ? '❌' : '⏳';
     return `${result} ${s.pair} ${s.dir} ${s.conf.toFixed(0)}%`;
@@ -406,7 +473,10 @@ async function runScan(mode) {
   const state = loadState();
   const mMode = marketMode();
 
-  // --report mode: send win rate report
+  // Always check for W/L replies first
+  const replyResult = await checkReplies();
+  console.log(`Replies checked: ${replyResult.checked}, processed: ${replyResult.replies || 0}`);
+
   if (mode === 'report') {
     const tracker = loadTracker();
     const ok = await sendTelegram(formatDailyReport(tracker));
@@ -414,30 +484,35 @@ async function runScan(mode) {
     return;
   }
 
-  // --test mode: send test message
   if (mode === 'test') {
     const tracker = loadTracker();
-    const msg = `🤖 Bot v13.1 ONLINE\n\n` +
+    const wr = tracker.wins + tracker.losses > 0
+      ? ((tracker.wins / (tracker.wins + tracker.losses)) * 100).toFixed(0)
+      : 'N/A';
+    const msg = `🤖 Bot v13.2 ONLINE\n\n` +
       `Platform: GitHub Actions (free, unlimited)\n` +
       `IQ Option | Binary Options | 5-min trades\n` +
       `20 pairs | Mode: ${mMode}\n` +
       `Strategy: Trend Following + ADX\n` +
-      `72% threshold | Score 7 trigger\n` +
-      `ADX threshold: ${ADX_THRESHOLD}\n` +
-      `7-min global cooldown | 15-min per-pair\n` +
-      `Win rate tracking: ACTIVE\n` +
-      `Signals tracked: ${tracker.signals.length}\n\n` +
+      `72% threshold | Score 7 | ADX ≥ ${ADX_THRESHOLD}\n` +
+      `7-min global | 15-min per-pair cooldown\n\n` +
+      `📈 Win Rate Tracking: ACTIVE\n` +
+      `Wins: ${tracker.wins} | Losses: ${tracker.losses}\n` +
+      `Win Rate: ${wr}${tracker.wins + tracker.losses > 0 ? '%' : ''}\n` +
+      `Pending: ${tracker.signals.filter(s => s.result === null).length}\n\n` +
+      `📝 To log results:\n` +
+      `Reply "W <ID>" for win\n` +
+      `Reply "L <ID>" for loss\n\n` +
       `Ready! ⚡`;
     const ok = await sendTelegram(msg);
     console.log(JSON.stringify({ testSent: ok, mode: mMode, pairs: 20, tracked: tracker.signals.length }));
     return;
   }
 
-  // Normal scan mode
+  // Normal scan
   if (state.globalCd && (Date.now() - state.globalCd) < GLOBAL_CD_MS) {
-    const elapsed = Math.round((Date.now() - state.globalCd) / 60000);
-    const remaining = Math.max(0, Math.round(GLOBAL_CD_MS / 60000 - elapsed));
-    console.log(JSON.stringify({ sent: 0, reason: 'global_cooldown', remainingMin: remaining, mode: mMode }));
+    const remaining = Math.max(0, Math.round(GLOBAL_CD_MS / 60000 - (Date.now() - state.globalCd) / 60000));
+    console.log(JSON.stringify({ sent: 0, reason: 'global_cooldown', remainingMin: remaining, mode: mMode, replies: replyResult.replies || 0 }));
     saveState(state);
     return;
   }
@@ -455,7 +530,7 @@ async function runScan(mode) {
   }
 
   if (signals.length === 0) {
-    console.log(JSON.stringify({ sent: 0, candidates: 0, mode: mMode, ts: new Date().toISOString() }));
+    console.log(JSON.stringify({ sent: 0, candidates: 0, mode: mMode, ts: new Date().toISOString(), replies: replyResult.replies || 0 }));
     saveState(state);
     return;
   }
@@ -481,17 +556,13 @@ async function runScan(mode) {
     await new Promise(r => setTimeout(r, 500));
   }
 
-  if (sent > 0) {
-    state.globalCd = Date.now();
-  }
+  if (sent > 0) state.globalCd = Date.now();
 
   saveState(state);
   console.log(JSON.stringify({
-    sent,
-    candidates: signals.length,
-    mode: mMode,
-    strategy: 'trend-following',
-    expiry: '5min',
+    sent, candidates: signals.length, mode: mMode,
+    strategy: 'trend-following', expiry: '5min',
+    replies: replyResult.replies || 0,
     ts: new Date().toISOString()
   }));
 }
