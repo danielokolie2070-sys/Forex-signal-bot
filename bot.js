@@ -1,8 +1,4 @@
 
-b8647cb8e_bot.js
-
-b8647cb8e_bot.js
-Download
 // =========================================================================
 // AI Forex Signal Bot v13 - GitHub Actions Edition
 // Platform: GitHub Actions (free, unlimited minutes on public repo)
