@@ -1,8 +1,4 @@
 
-c7c33330a_bot.js
-
-c7c33330a_bot.js
-Download
 // =========================================================================
 // AI Forex Signal Bot v13.2 - GitHub Actions Edition
 // Platform: GitHub Actions (free, unlimited minutes on public repo)
