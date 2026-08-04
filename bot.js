@@ -22,7 +22,7 @@ const SIG_MEM_MS = 25 * 60 * 1000;
 const GLOBAL_CD_MS = 7 * 60 * 1000;
 const CONFIDENCE_THRESHOLD = 80; // High-conviction signals only
 const SCORE_TRIGGER = 7;
-const ADX_THRESHOLD = 8;
+const ADX_THRESHOLD = 5; // Lowered for simplified ADX calc
 
 // === WIN RATE TRACKER ===
 
@@ -361,7 +361,7 @@ function analyze(pair, d15, d1h) {
 
   if (!dir) return null;
 
-  const conf = Math.min(95, 45 + sc * 4);
+  const conf = Math.min(95, 45 + sc * 5); // Score 7 = 80%, Score 8 = 85%, Score 9 = 90%
   if (conf < CONFIDENCE_THRESHOLD) return null;
 
   const mode = marketMode();
